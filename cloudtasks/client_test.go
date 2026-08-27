@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,8 +26,7 @@ func TestDispatchCreatesRESTTask(t *testing.T) {
 			t.Fatal(err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"name":"tasks/1"}`))
+		_, _ = w.Write([]byte(`{"name":"projects/p/locations/asia-northeast1/queues/q/tasks/provider-id"}`))
 	}))
 	defer server.Close()
 
@@ -43,13 +43,20 @@ func TestDispatchCreatesRESTTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	d.now = func() time.Time { return time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC) }
 
 	runAt := time.Date(2026, 8, 28, 1, 2, 3, 0, time.UTC)
-	job := runlater.Job{Name: "email.send", Payload: json.RawMessage(`{"user_id":42}`), RunAt: runAt}
-	if err := d.Dispatch(context.Background(), job); err != nil {
+	job := runlater.Job{ID: "welcome-42", Name: "email.send", Payload: json.RawMessage(`{"user_id":42}`), RunAt: runAt}
+	receipt, err := d.Dispatch(context.Background(), job)
+	if err != nil {
 		t.Fatal(err)
 	}
-
+	if receipt.ID != job.ID || !strings.Contains(receipt.ProviderID, "provider-id") {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+	if got.Task.Name == "" {
+		t.Fatal("expected deterministic task name")
+	}
 	if got.Task.ScheduleTime != "2026-08-28T01:02:03Z" {
 		t.Fatalf("scheduleTime = %q", got.Task.ScheduleTime)
 	}
@@ -61,12 +68,38 @@ func TestDispatchCreatesRESTTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var env envelope
-	if err := json.Unmarshal(decoded, &env); err != nil {
+	env, err := runlater.DecodeEnvelope(decoded)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if env.Name != "email.send" || string(env.Payload) != `{"user_id":42}` {
+	if env.ID != "welcome-42" || env.Name != "email.send" || string(env.Payload) != `{"user_id":42}` {
 		t.Fatalf("envelope = %+v", env)
+	}
+}
+
+func TestDispatchTreatsAlreadyExistsAsIdempotentSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "already exists", http.StatusConflict)
+	}))
+	defer server.Close()
+
+	d, err := New(Config{
+		Project:     "p",
+		Location:    "l",
+		Queue:       "q",
+		TargetURL:   "https://example.com/jobs",
+		TokenSource: StaticTokenSource("test-token"),
+		APIEndpoint: server.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := d.Dispatch(context.Background(), runlater.Job{ID: "same", Name: "x", Payload: json.RawMessage(`null`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.ID != "same" || receipt.ProviderID == "" {
+		t.Fatalf("receipt = %+v", receipt)
 	}
 }
 
@@ -87,7 +120,26 @@ func TestDispatchReturnsAPIError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Dispatch(context.Background(), runlater.Job{Name: "x", Payload: json.RawMessage(`null`)}); err == nil {
+	if _, err := d.Dispatch(context.Background(), runlater.Job{ID: "id", Name: "x", Payload: json.RawMessage(`null`)}); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestNewRejectsRelativeTarget(t *testing.T) {
+	_, err := New(Config{Project: "p", Location: "l", Queue: "q", TargetURL: "/jobs", TokenSource: StaticTokenSource("x")})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDispatchRejectsBeyondThirtyDays(t *testing.T) {
+	d, err := New(Config{Project: "p", Location: "l", Queue: "q", TargetURL: "https://example.com/jobs", TokenSource: StaticTokenSource("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.now = func() time.Time { return time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC) }
+	_, err = d.Dispatch(context.Background(), runlater.Job{ID: "id", Name: "x", Payload: json.RawMessage(`null`), RunAt: d.now().Add(31 * 24 * time.Hour)})
+	if err == nil {
 		t.Fatal("expected error")
 	}
 }

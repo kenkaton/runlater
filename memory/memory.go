@@ -7,21 +7,21 @@ import (
 	"github.com/kenkaton/runlater"
 )
 
-// Dispatcher stores jobs in memory for tests and local development.
+// Dispatcher stores jobs in memory for tests and local development. It is not durable.
 type Dispatcher struct {
 	mu   sync.Mutex
 	jobs []runlater.Job
 }
 
 // Dispatch records job and returns immediately.
-func (d *Dispatcher) Dispatch(_ context.Context, job runlater.Job) error {
+func (d *Dispatcher) Dispatch(_ context.Context, job runlater.Job) (runlater.Receipt, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	copyJob := job
 	copyJob.Payload = append([]byte(nil), job.Payload...)
 	d.jobs = append(d.jobs, copyJob)
-	return nil
+	return runlater.Receipt{ID: job.ID, ProviderID: job.ID}, nil
 }
 
 // Jobs returns a snapshot of all dispatched jobs.

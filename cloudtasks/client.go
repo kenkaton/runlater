@@ -3,7 +3,9 @@ package cloudtasks
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,7 +17,11 @@ import (
 	"github.com/kenkaton/runlater"
 )
 
-const defaultAPIEndpoint = "https://cloudtasks.googleapis.com"
+const (
+	defaultAPIEndpoint = "https://cloudtasks.googleapis.com"
+	maxTaskBytes       = 1 << 20
+	maxScheduleAhead   = 30 * 24 * time.Hour
+)
 
 // TokenSource provides OAuth2 access tokens for the Cloud Tasks REST API.
 type TokenSource interface {
@@ -35,7 +41,8 @@ type Config struct {
 	APIEndpoint         string
 }
 
-// Dispatcher persists runlater jobs in Google Cloud Tasks using the REST API.
+// Dispatcher hands runlater jobs off to Google Cloud Tasks using the REST API.
+// Cloud Tasks provides durable, at-least-once delivery. Handlers must be idempotent.
 type Dispatcher struct {
 	project             string
 	location            string
@@ -46,6 +53,7 @@ type Dispatcher struct {
 	httpClient          *http.Client
 	tokenSource         TokenSource
 	apiEndpoint         string
+	now                 func() time.Time
 }
 
 // New creates a Cloud Tasks dispatcher. If TokenSource is nil, the Google Cloud
@@ -54,8 +62,9 @@ func New(cfg Config) (*Dispatcher, error) {
 	if cfg.Project == "" || cfg.Location == "" || cfg.Queue == "" || cfg.TargetURL == "" {
 		return nil, fmt.Errorf("cloudtasks: Project, Location, Queue, and TargetURL are required")
 	}
-	if _, err := url.ParseRequestURI(cfg.TargetURL); err != nil {
-		return nil, fmt.Errorf("cloudtasks: invalid TargetURL: %w", err)
+	u, err := url.Parse(cfg.TargetURL)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil, fmt.Errorf("cloudtasks: TargetURL must be an absolute http(s) URL")
 	}
 
 	hc := cfg.HTTPClient
@@ -81,12 +90,8 @@ func New(cfg Config) (*Dispatcher, error) {
 		httpClient:          hc,
 		tokenSource:         ts,
 		apiEndpoint:         endpoint,
+		now:                 time.Now,
 	}, nil
-}
-
-type envelope struct {
-	Name    string          `json:"name"`
-	Payload json.RawMessage `json:"payload"`
 }
 
 type oidcToken struct {
@@ -103,6 +108,7 @@ type httpRequest struct {
 }
 
 type task struct {
+	Name         string      `json:"name,omitempty"`
 	HTTPRequest  httpRequest `json:"httpRequest"`
 	ScheduleTime string      `json:"scheduleTime,omitempty"`
 }
@@ -111,20 +117,35 @@ type createTaskRequest struct {
 	Task task `json:"task"`
 }
 
-// Dispatch creates one Cloud Task. The target receives a JSON envelope with
-// "name" and "payload" fields.
-func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) error {
-	payload, err := json.Marshal(envelope{Name: job.Name, Payload: job.Payload})
-	if err != nil {
-		return fmt.Errorf("cloudtasks: marshal envelope: %w", err)
+type createTaskResponse struct {
+	Name string `json:"name"`
+}
+
+// Dispatch creates one Cloud Task. A stable runlater job ID maps to a stable
+// Cloud Tasks task name, making ambiguous client retries safe for the same ID.
+func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) (runlater.Receipt, error) {
+	if job.ID == "" {
+		return runlater.Receipt{}, fmt.Errorf("cloudtasks: job ID is required")
+	}
+	if !job.RunAt.IsZero() && job.RunAt.After(d.now().Add(maxScheduleAhead)) {
+		return runlater.Receipt{}, fmt.Errorf("cloudtasks: RunAt exceeds Cloud Tasks 30-day scheduling limit")
 	}
 
-	reqBody := createTaskRequest{Task: task{HTTPRequest: httpRequest{
-		URL:        d.targetURL,
-		HTTPMethod: http.MethodPost,
-		Headers:    map[string]string{"Content-Type": "application/json"},
-		Body:       base64.StdEncoding.EncodeToString(payload),
-	}}}
+	payload, err := runlater.EncodeEnvelope(job)
+	if err != nil {
+		return runlater.Receipt{}, fmt.Errorf("cloudtasks: encode envelope: %w", err)
+	}
+
+	providerID := d.taskName(job.ID)
+	reqBody := createTaskRequest{Task: task{
+		Name: providerID,
+		HTTPRequest: httpRequest{
+			URL:        d.targetURL,
+			HTTPMethod: http.MethodPost,
+			Headers:    map[string]string{"Content-Type": "application/json"},
+			Body:       base64.StdEncoding.EncodeToString(payload),
+		},
+	}}
 	if d.serviceAccountEmail != "" {
 		reqBody.Task.HTTPRequest.OIDCToken = &oidcToken{
 			ServiceAccountEmail: d.serviceAccountEmail,
@@ -137,12 +158,15 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) error {
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return fmt.Errorf("cloudtasks: marshal request: %w", err)
+		return runlater.Receipt{}, fmt.Errorf("cloudtasks: marshal request: %w", err)
+	}
+	if len(body) > maxTaskBytes {
+		return runlater.Receipt{}, fmt.Errorf("cloudtasks: task exceeds 1 MiB Cloud Tasks limit")
 	}
 
 	token, err := d.tokenSource.Token(ctx)
 	if err != nil {
-		return fmt.Errorf("cloudtasks: get access token: %w", err)
+		return runlater.Receipt{}, fmt.Errorf("cloudtasks: get access token: %w", err)
 	}
 
 	endpoint := fmt.Sprintf("%s/v2/projects/%s/locations/%s/queues/%s/tasks",
@@ -153,20 +177,40 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) error {
 	)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("cloudtasks: create request: %w", err)
+		return runlater.Receipt{}, fmt.Errorf("cloudtasks: create request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("cloudtasks: create task: %w", err)
+		return runlater.Receipt{}, fmt.Errorf("cloudtasks: create task: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// ALREADY_EXISTS means the same logical job ID was accepted earlier. Treat it
+	// as a successful idempotent handoff rather than forcing callers to guess.
+	if resp.StatusCode == http.StatusConflict {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return runlater.Receipt{ID: job.ID, ProviderID: providerID}, nil
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("cloudtasks: create task: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return runlater.Receipt{}, fmt.Errorf("cloudtasks: create task: %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
-	return nil
+
+	var out createTaskResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil && err != io.EOF {
+		return runlater.Receipt{}, fmt.Errorf("cloudtasks: decode response: %w", err)
+	}
+	if out.Name != "" {
+		providerID = out.Name
+	}
+	return runlater.Receipt{ID: job.ID, ProviderID: providerID}, nil
+}
+
+func (d *Dispatcher) taskName(id string) string {
+	sum := sha256.Sum256([]byte(id))
+	taskID := hex.EncodeToString(sum[:])
+	return fmt.Sprintf("projects/%s/locations/%s/queues/%s/tasks/%s", d.project, d.location, d.queue, taskID)
 }

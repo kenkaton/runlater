@@ -1,85 +1,111 @@
 # runlater
 
-> Run work later. Reliably.
+> Hand work off now. Run it later, reliably.
 
-`runlater` is a tiny durable-background-work primitive for Go.
+`runlater` is a small **durable handoff primitive** for Go applications.
 
-Application code says **what should run later**. A dispatcher decides **how it is durably delivered**.
-
-```go
-later := runlater.New(dispatcher)
-
-err := later.Do(ctx, "email.send", EmailPayload{
-    UserID: 42,
-})
-```
-
-The first production dispatcher uses Google Cloud Tasks over its REST API — no gRPC, no protobuf, and no Google Cloud Go SDK.
-
-## Why
-
-A small piece of background work should not force cloud-specific task types through your application or pull a large SDK dependency graph into your service.
-
-`runlater` keeps the application boundary deliberately small:
+It is intentionally not another worker framework. Your cloud already has durable execution systems such as Google Cloud Tasks. `runlater` gives application code one small contract for handing work to those systems without importing their SDK types, worker runtimes, or infrastructure concerns.
 
 ```go
-Do(ctx, name, payload, ...options)
-```
-
-Its intended semantics are:
-
-- durable handoff to the configured backend
-- at-least-once execution (when provided by the backend)
-- JSON-serializable payloads
-- optional delayed execution
-- provider-specific details stay at the edge
-
-`runlater` is not trying to hide meaningful differences between every queue system. It defines a small background-work primitive and lets backends implement that primitive honestly.
-
-## Install
-
-```bash
-go get github.com/kenkaton/runlater
-```
-
-## Google Cloud Tasks
-
-```go
-package main
-
-import (
-    "context"
-
-    "github.com/kenkaton/runlater"
-    "github.com/kenkaton/runlater/cloudtasks"
+receipt, err := later.Do(
+    ctx,
+    "email.send",
+    EmailPayload{UserID: 42},
+    runlater.ID("welcome-email:42"),
 )
+```
 
-type EmailPayload struct {
-    UserID int64 `json:"user_id"`
+The first production backend is Google Cloud Tasks over REST: no gRPC, no protobuf, no Google Cloud Go SDK, and no worker daemon.
+
+## Why this exists
+
+Go already has excellent background-job libraries. If you want Redis/Postgres-backed workers, retries, cron, dashboards, workflow primitives, or queue ownership inside your application, use those libraries.
+
+`runlater` targets a narrower problem:
+
+> **I already trust my cloud to execute durable background work. I only want a tiny, testable boundary in my Go application for handing work to it.**
+
+That leads to a deliberately different architecture:
+
+```text
+application
+    |
+    | runlater.Do(...)
+    v
+runlater handoff contract
+    |
+    +---- Cloud Tasks (first backend)
+    +---- other cloud-native durable backends only when semantics fit
+
+provider invokes HTTP target
+    |
+    v
+httpjob.Mux
+    |
+    v
+typed Go handler
+```
+
+### Non-goals
+
+`runlater` does **not** aim to become:
+
+- a Redis/Postgres job server
+- a worker-pool framework
+- a workflow engine
+- a generic message-broker abstraction
+- a lowest-common-denominator wrapper over every queue product
+
+Provider differences that affect correctness stay visible in backend documentation.
+
+## The contract
+
+The root package defines only the handoff semantics:
+
+```go
+type Job struct {
+    ID      string
+    Name    string
+    Payload json.RawMessage
+    RunAt   time.Time
 }
 
-func enqueue(ctx context.Context) error {
-    dispatcher, err := cloudtasks.New(cloudtasks.Config{
-        Project:   "my-project",
-        Location:  "asia-northeast1",
-        Queue:     "default",
-        TargetURL: "https://my-service.run.app/internal/jobs",
-    })
-    if err != nil {
-        return err
-    }
-
-    later := runlater.New(dispatcher)
-    return later.Do(ctx, "email.send", EmailPayload{UserID: 42})
+type Dispatcher interface {
+    Dispatch(context.Context, Job) (Receipt, error)
 }
 ```
 
-On Cloud Run, `cloudtasks.New` uses the metadata server for the attached service account's OAuth access token by default.
+A successful `Dispatch` means the backend has accepted responsibility for the job according to that backend's documented guarantees.
 
-The target receives:
+**Durability is a backend guarantee, not a lie told by the interface.** For example, the `memory` dispatcher is useful for tests but is explicitly not durable.
+
+## Stable job IDs and safe retries
+
+Every job has a logical ID. `runlater` generates one by default, but important jobs should usually provide a stable ID:
+
+```go
+receipt, err := later.Do(
+    ctx,
+    "email.send",
+    payload,
+    runlater.ID("welcome-email:"+userID),
+)
+```
+
+The Cloud Tasks backend maps that logical ID to a deterministic Cloud Tasks task name. Repeating the same handoff ID therefore maps to the same provider task, and `ALREADY_EXISTS` is treated as an idempotent success.
+
+This addresses a common distributed-systems failure mode: the provider accepted a task, but the client lost the response and cannot tell whether retrying will duplicate the enqueue.
+
+This does **not** provide exactly-once execution. Cloud Tasks is at-least-once. **Handlers must be idempotent.**
+
+## Versioned wire protocol
+
+HTTP-style backends use a small versioned envelope:
 
 ```json
 {
+  "version": 1,
+  "id": "welcome-email:42",
   "name": "email.send",
   "payload": {
     "user_id": 42
@@ -87,43 +113,72 @@ The target receives:
 }
 ```
 
-### Delayed work
+Versioning the envelope early keeps producers and consumers evolvable without coupling application code to provider payload formats.
+
+## Receiving jobs
+
+`httpjob` is the other half of the primitive. It routes the wire protocol to typed Go handlers using only `net/http`.
 
 ```go
-err := later.Do(ctx, "email.send", payload, runlater.After(5*time.Minute))
+mux := httpjob.New()
+
+err := httpjob.HandleJSON(mux, "email.send", func(ctx context.Context, p EmailPayload) error {
+    return sendEmail(ctx, p.UserID)
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+http.Handle("/internal/jobs", mux)
 ```
 
-or at a specific time:
+Malformed envelopes and unknown jobs return 4xx responses. Handler failures return 500 so durable HTTP backends can retry according to their policies.
 
-```go
-err := later.Do(ctx, "email.send", payload, runlater.At(runAt))
-```
-
-### Authenticated Cloud Run targets
-
-If authentication is configured per task:
+## Google Cloud Tasks
 
 ```go
 dispatcher, err := cloudtasks.New(cloudtasks.Config{
-    Project:             "my-project",
-    Location:            "asia-northeast1",
-    Queue:               "default",
-    TargetURL:           "https://my-service.run.app/internal/jobs",
-    ServiceAccountEmail: "cloud-tasks@my-project.iam.gserviceaccount.com",
+    Project:   "my-project",
+    Location:  "asia-northeast1",
+    Queue:     "default",
+    TargetURL: "https://my-service.run.app/internal/jobs",
 })
+if err != nil {
+    return err
+}
+
+later := runlater.New(dispatcher)
+
+_, err = later.Do(ctx, "email.send", EmailPayload{UserID: 42})
 ```
 
-You can also configure OIDC at the Cloud Tasks queue level and omit `ServiceAccountEmail` from application code.
+On Cloud Run, the backend uses the metadata server for the attached service account's OAuth token by default.
+
+Authenticated targets can use task-level OIDC configuration, or preferably queue-level target/auth configuration when you want IAM concerns kept out of application code.
+
+### Delayed execution
+
+```go
+_, err := later.Do(ctx, "email.send", payload, runlater.After(5*time.Minute))
+```
+
+or:
+
+```go
+_, err := later.Do(ctx, "email.send", payload, runlater.At(runAt))
+```
+
+The Cloud Tasks backend validates provider-specific constraints such as its scheduling horizon and task-size limit.
 
 ## Testing
 
-Use the in-memory dispatcher without Cloud Tasks, credentials, an emulator, or a worker process:
+No emulator, credentials, Redis, or worker process is required for unit tests.
 
 ```go
 mem := &memory.Dispatcher{}
 later := runlater.New(mem)
 
-_ = later.Do(ctx, "email.send", payload)
+_, _ = later.Do(ctx, "email.send", payload, runlater.ID("test-job"))
 
 jobs := mem.Jobs()
 ```
@@ -132,17 +187,31 @@ jobs := mem.Jobs()
 
 The module currently has **zero third-party dependencies**.
 
-The Cloud Tasks backend talks directly to the documented REST API using `net/http`. This is intentional: keeping the dependency and security-alert surface small is one of the project's core goals.
+This is a product constraint, not a stunt. The original motivation for `runlater` was that a tiny background handoff should not introduce gRPC, protobuf, a large cloud SDK dependency graph, unrelated vulnerability alerts, or additional worker infrastructure.
 
-## Scope
+Backends should remain standard-library-first where doing so does not compromise correctness.
 
-The initial focus is Cloud Run + Cloud Tasks because that is where the original problem showed up. The core API is provider-neutral so other serverless-native durable backends can be added later without turning the project into a generic queue framework.
+## How it differs from existing Go job libraries
 
-Potential future backends include SQS and local/inline execution, but only where their semantics map cleanly to the primitive.
+Libraries such as Asynq and gocraft/work own a worker runtime and use Redis. Neoq abstracts multiple queue/storage backends and also provides job processing features. River owns durable jobs in Postgres. Those are good choices when the application wants to own the job system.
+
+`runlater` deliberately owns much less:
+
+| Concern | runlater | Traditional Go job framework |
+| --- | --- | --- |
+| Durable store | Cloud/provider owns it | Library/app owns it |
+| Worker runtime | Provider invokes target | Library runs workers |
+| Redis/Postgres required | No | Often |
+| Cloud SDK types in app | No | N/A |
+| Provider-native retry/rate limiting | Reused | Reimplemented/configured by framework |
+| Main abstraction | Durable handoff | Queue + workers |
+| Third-party dependencies | 0 today | Usually several |
+
+The project should only add a backend when it can preserve the handoff contract without pretending important semantic differences do not exist.
 
 ## Status
 
-Early development. Expect API changes before v1.
+Pre-v1. The API is intentionally still being challenged before the first stable release.
 
 ## License
 
