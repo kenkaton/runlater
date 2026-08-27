@@ -43,7 +43,6 @@ func TestDispatchCreatesRESTTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d.now = func() time.Time { return time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC) }
 
 	runAt := time.Date(2026, 8, 28, 1, 2, 3, 0, time.UTC)
 	job := runlater.Job{ID: "welcome-42", Name: "email.send", Payload: json.RawMessage(`{"user_id":42}`), RunAt: runAt}
@@ -79,7 +78,9 @@ func TestDispatchCreatesRESTTask(t *testing.T) {
 
 func TestDispatchTreatsAlreadyExistsAsIdempotentSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "already exists", http.StatusConflict)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":{"code":409,"message":"task exists","status":"ALREADY_EXISTS"}}`))
 	}))
 	defer server.Close()
 
@@ -100,6 +101,20 @@ func TestDispatchTreatsAlreadyExistsAsIdempotentSuccess(t *testing.T) {
 	}
 	if receipt.ID != "same" || receipt.ProviderID == "" {
 		t.Fatalf("receipt = %+v", receipt)
+	}
+}
+
+func TestDispatchDoesNotTreatArbitraryConflictAsSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "conflict", http.StatusConflict)
+	}))
+	defer server.Close()
+	d, err := New(Config{Project: "p", Location: "l", Queue: "q", TargetURL: "https://example.com/jobs", TokenSource: StaticTokenSource("x"), APIEndpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Dispatch(context.Background(), runlater.Job{ID: "id", Name: "x", Payload: json.RawMessage(`null`)}); err == nil {
+		t.Fatal("expected error")
 	}
 }
 
@@ -127,18 +142,6 @@ func TestDispatchReturnsAPIError(t *testing.T) {
 
 func TestNewRejectsRelativeTarget(t *testing.T) {
 	_, err := New(Config{Project: "p", Location: "l", Queue: "q", TargetURL: "/jobs", TokenSource: StaticTokenSource("x")})
-	if err == nil {
-		t.Fatal("expected error")
-	}
-}
-
-func TestDispatchRejectsBeyondThirtyDays(t *testing.T) {
-	d, err := New(Config{Project: "p", Location: "l", Queue: "q", TargetURL: "https://example.com/jobs", TokenSource: StaticTokenSource("x")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	d.now = func() time.Time { return time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC) }
-	_, err = d.Dispatch(context.Background(), runlater.Job{ID: "id", Name: "x", Payload: json.RawMessage(`null`), RunAt: d.now().Add(31 * 24 * time.Hour)})
 	if err == nil {
 		t.Fatal("expected error")
 	}

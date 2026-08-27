@@ -17,11 +17,7 @@ import (
 	"github.com/kenkaton/runlater"
 )
 
-const (
-	defaultAPIEndpoint = "https://cloudtasks.googleapis.com"
-	maxTaskBytes       = 1 << 20
-	maxScheduleAhead   = 30 * 24 * time.Hour
-)
+const defaultAPIEndpoint = "https://cloudtasks.googleapis.com"
 
 // TokenSource provides OAuth2 access tokens for the Cloud Tasks REST API.
 type TokenSource interface {
@@ -53,7 +49,6 @@ type Dispatcher struct {
 	httpClient          *http.Client
 	tokenSource         TokenSource
 	apiEndpoint         string
-	now                 func() time.Time
 }
 
 // New creates a Cloud Tasks dispatcher. If TokenSource is nil, the Google Cloud
@@ -90,7 +85,6 @@ func New(cfg Config) (*Dispatcher, error) {
 		httpClient:          hc,
 		tokenSource:         ts,
 		apiEndpoint:         endpoint,
-		now:                 time.Now,
 	}, nil
 }
 
@@ -121,14 +115,20 @@ type createTaskResponse struct {
 	Name string `json:"name"`
 }
 
+type apiErrorResponse struct {
+	Error struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Status  string `json:"status"`
+	} `json:"error"`
+}
+
 // Dispatch creates one Cloud Task. A stable runlater job ID maps to a stable
-// Cloud Tasks task name, making ambiguous client retries safe for the same ID.
+// Cloud Tasks task name, making ambiguous client retries safe within Cloud
+// Tasks' own task-name deduplication semantics.
 func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) (runlater.Receipt, error) {
 	if job.ID == "" {
 		return runlater.Receipt{}, fmt.Errorf("cloudtasks: job ID is required")
-	}
-	if !job.RunAt.IsZero() && job.RunAt.After(d.now().Add(maxScheduleAhead)) {
-		return runlater.Receipt{}, fmt.Errorf("cloudtasks: RunAt exceeds Cloud Tasks 30-day scheduling limit")
 	}
 
 	payload, err := runlater.EncodeEnvelope(job)
@@ -160,9 +160,6 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) (runlater.R
 	if err != nil {
 		return runlater.Receipt{}, fmt.Errorf("cloudtasks: marshal request: %w", err)
 	}
-	if len(body) > maxTaskBytes {
-		return runlater.Receipt{}, fmt.Errorf("cloudtasks: task exceeds 1 MiB Cloud Tasks limit")
-	}
 
 	token, err := d.tokenSource.Token(ctx)
 	if err != nil {
@@ -188,23 +185,24 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) (runlater.R
 	}
 	defer resp.Body.Close()
 
-	// ALREADY_EXISTS means the same logical job ID was accepted earlier. Treat it
-	// as a successful idempotent handoff rather than forcing callers to guess.
-	if resp.StatusCode == http.StatusConflict {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return runlater.Receipt{ID: job.ID, ProviderID: providerID}, nil
-	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		var apiErr apiErrorResponse
+		_ = json.Unmarshal(b, &apiErr)
+		if resp.StatusCode == http.StatusConflict && apiErr.Error.Status == "ALREADY_EXISTS" {
+			return runlater.Receipt{ID: job.ID, ProviderID: providerID}, nil
+		}
 		return runlater.Receipt{}, fmt.Errorf("cloudtasks: create task: %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 
+	// A 2xx means Cloud Tasks accepted responsibility. Response decoding is
+	// best-effort: returning an error here would turn a successful handoff into
+	// an ambiguous failure and could cause a caller to enqueue a new logical ID.
 	var out createTaskResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil && err != io.EOF {
-		return runlater.Receipt{}, fmt.Errorf("cloudtasks: decode response: %w", err)
-	}
-	if out.Name != "" {
+	if err := json.NewDecoder(resp.Body).Decode(&out); err == nil && out.Name != "" {
 		providerID = out.Name
+	} else {
+		_, _ = io.Copy(io.Discard, resp.Body)
 	}
 	return runlater.Receipt{ID: job.ID, ProviderID: providerID}, nil
 }

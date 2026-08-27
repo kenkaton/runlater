@@ -53,6 +53,7 @@ type options struct {
 	id       string
 	delay    time.Duration
 	runAt    time.Time
+	hasID    bool
 	hasDelay bool
 	hasRunAt bool
 }
@@ -61,13 +62,17 @@ type options struct {
 type Option func(*options) error
 
 // ID gives the job a stable logical identifier. Reusing the same ID lets
-// backends that support deduplication make retries safer.
+// backends that support deduplication make ambiguous enqueue retries safer.
 func ID(id string) Option {
 	return func(o *options) error {
 		if id == "" {
 			return errors.New("runlater: job ID is empty")
 		}
+		if o.hasID {
+			return errors.New("runlater: ID specified more than once")
+		}
 		o.id = id
+		o.hasID = true
 		return nil
 	}
 }
@@ -128,7 +133,7 @@ func (c *Client) Do(ctx context.Context, name string, payload any, opts ...Optio
 	}
 
 	id := cfg.id
-	if id == "" {
+	if !cfg.hasID {
 		id, err = c.newID()
 		if err != nil {
 			return Receipt{}, fmt.Errorf("runlater: generate job ID: %w", err)

@@ -92,7 +92,7 @@ receipt, err := later.Do(
 )
 ```
 
-The Cloud Tasks backend maps that logical ID to a deterministic Cloud Tasks task name. Repeating the same handoff ID therefore maps to the same provider task, and `ALREADY_EXISTS` is treated as an idempotent success.
+The Cloud Tasks backend hashes that logical ID into a deterministic Cloud Tasks task name. Repeating the same handoff ID therefore maps to the same provider task, and an `ALREADY_EXISTS` response is treated as an idempotent success **within Cloud Tasks' own task-name deduplication semantics**.
 
 This addresses a common distributed-systems failure mode: the provider accepted a task, but the client lost the response and cannot tell whether retrying will duplicate the enqueue.
 
@@ -168,7 +168,7 @@ or:
 _, err := later.Do(ctx, "email.send", payload, runlater.At(runAt))
 ```
 
-The Cloud Tasks backend validates provider-specific constraints such as its scheduling horizon and task-size limit.
+Provider quotas and evolving service limits are intentionally left to the provider API instead of being duplicated as stale policy inside `runlater`.
 
 ## Testing
 
