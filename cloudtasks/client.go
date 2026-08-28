@@ -198,6 +198,11 @@ type apiErrorResponse struct {
 // ran or was deleted (about nine days for queues created from queue.yaml), so a
 // deduplicated receipt can mean the job already ran. Work that must run again
 // needs a different logical ID.
+//
+// If the HTTP exchange fails before a response is received, the returned error
+// wraps runlater.ErrAmbiguousHandoff and the Receipt contains both the logical
+// ID and deterministic Cloud Tasks name. The provider may already have accepted
+// the task, so retry the same logical ID.
 func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) (runlater.Receipt, error) {
 	if job.ID == "" {
 		return runlater.Receipt{}, runlater.ErrEmptyID
@@ -253,7 +258,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) (runlater.R
 
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
-		return runlater.Receipt{}, fmt.Errorf("cloudtasks: create task: %w", err)
+		return runlater.Receipt{ID: job.ID, ProviderID: providerID}, fmt.Errorf("%w: cloudtasks: create task: %w", runlater.ErrAmbiguousHandoff, err)
 	}
 	defer resp.Body.Close()
 

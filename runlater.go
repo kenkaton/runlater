@@ -31,6 +31,11 @@ var (
 	// ErrInvalidOption wraps every Option misuse, so callers can match all of
 	// them with errors.Is without depending on individual messages.
 	ErrInvalidOption = errors.New("runlater: invalid option")
+	// ErrAmbiguousHandoff marks a dispatch attempt whose outcome is unknown.
+	// The provider may already have accepted the job even though the caller did
+	// not receive a successful response. Retry the same logical ID rather than
+	// creating a new one.
+	ErrAmbiguousHandoff = errors.New("runlater: ambiguous handoff outcome")
 )
 
 // Job is the runlater handoff contract. Backends may add stronger guarantees,
@@ -44,7 +49,12 @@ type Job struct {
 	RunAt   time.Time
 }
 
-// Receipt identifies the provider-side handoff created for a job.
+// Receipt identifies a handoff attempt.
+//
+// On success, ProviderID identifies the provider-side job that accepted
+// responsibility. On error, fields may still be populated so callers can
+// safely reason about or retry an uncertain handoff; their presence does not
+// imply that the provider accepted the job.
 type Receipt struct {
 	ID         string
 	ProviderID string
@@ -142,6 +152,11 @@ func At(t time.Time) Option {
 
 // Do serializes payload as JSON and hands the job to the configured Dispatcher.
 // It returns only after the backend has accepted responsibility for the job.
+//
+// If dispatch fails after the logical ID has been chosen, the returned Receipt
+// still contains that ID. This is especially important for generated IDs: a
+// caller can retain the identity of an uncertain attempt instead of retrying
+// with a new logical job by accident.
 func (c *Client) Do(ctx context.Context, name string, payload any, opts ...Option) (Receipt, error) {
 	if c == nil || c.dispatcher == nil {
 		return Receipt{}, ErrNoDispatcher
@@ -181,12 +196,16 @@ func (c *Client) Do(ctx context.Context, name string, payload any, opts ...Optio
 		runAt = c.now().Add(cfg.delay)
 	}
 
-	return c.dispatcher.Dispatch(ctx, Job{
+	receipt, err := c.dispatcher.Dispatch(ctx, Job{
 		ID:      id,
 		Name:    name,
 		Payload: body,
 		RunAt:   runAt,
 	})
+	if err != nil && receipt.ID == "" {
+		receipt.ID = id
+	}
+	return receipt, err
 }
 
 func randomID() (string, error) {

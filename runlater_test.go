@@ -16,6 +16,16 @@ func (d *captureDispatcher) Dispatch(_ context.Context, job Job) (Receipt, error
 	return Receipt{ID: job.ID, ProviderID: "provider/" + job.ID}, nil
 }
 
+type failingDispatcher struct {
+	job Job
+	err error
+}
+
+func (d *failingDispatcher) Dispatch(_ context.Context, job Job) (Receipt, error) {
+	d.job = job
+	return Receipt{}, d.err
+}
+
 func TestDo(t *testing.T) {
 	d := &captureDispatcher{}
 	c := New(d)
@@ -50,6 +60,46 @@ func TestDoGeneratesID(t *testing.T) {
 	if d.job.ID != "generated" {
 		t.Fatalf("ID = %q", d.job.ID)
 	}
+}
+
+func TestDoPreservesGeneratedIDWhenDispatchFails(t *testing.T) {
+	wantErr := errors.New("network outcome unknown")
+	d := &failingDispatcher{err: wantErr}
+	c := New(d)
+	c.newID = func() (string, error) { return "generated", nil }
+
+	receipt, err := c.Do(context.Background(), "job", nil)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+	if receipt.ID != "generated" {
+		t.Fatalf("receipt ID = %q, want generated", receipt.ID)
+	}
+	if d.job.ID != receipt.ID {
+		t.Fatalf("dispatched ID = %q, receipt ID = %q", d.job.ID, receipt.ID)
+	}
+}
+
+func TestDoPreservesDispatcherReceiptOnError(t *testing.T) {
+	wantErr := errors.New("ambiguous")
+	d := DispatcherFunc(func(_ context.Context, job Job) (Receipt, error) {
+		return Receipt{ID: job.ID, ProviderID: "provider/known"}, wantErr
+	})
+
+	receipt, err := New(d).Do(context.Background(), "job", nil, ID("stable"))
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+	if receipt.ID != "stable" || receipt.ProviderID != "provider/known" {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+}
+
+// DispatcherFunc adapts a function to Dispatcher for focused contract tests.
+type DispatcherFunc func(context.Context, Job) (Receipt, error)
+
+func (f DispatcherFunc) Dispatch(ctx context.Context, job Job) (Receipt, error) {
+	return f(ctx, job)
 }
 
 func TestDoRejectsAtAndAfterTogetherEvenZeroDelay(t *testing.T) {
