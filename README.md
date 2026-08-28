@@ -88,7 +88,7 @@ The root package deliberately knows nothing about queues, service accounts, Redi
 
 ## Job identity and retry safety
 
-Every job has a logical ID.
+A job's logical identity is the pair **`(Name, ID)`**. `Name` identifies the kind of work; `ID` identifies one logical occurrence of that work.
 
 If no ID is supplied, `runlater` generates one. A generated ID gives the job a unique identity, but **does not make a repeated call retry-safe**, because the next call receives a different ID.
 
@@ -103,7 +103,9 @@ receipt, err := later.Do(
 )
 ```
 
-The Cloud Tasks backend deterministically maps that logical ID to a Cloud Tasks task name. Repeating the same handoff ID therefore maps to the same provider task. When Cloud Tasks explicitly reports `ALREADY_EXISTS`, the backend can treat that as an idempotent handoff success within Cloud Tasks' task-name deduplication semantics.
+The Cloud Tasks backend deterministically maps `(Name, ID)` to a Cloud Tasks task name. Repeating the same handoff therefore maps to the same provider task, while two different job names may safely reuse the same local ID. When Cloud Tasks explicitly reports `ALREADY_EXISTS`, the backend can treat that as an idempotent handoff success within Cloud Tasks' task-name deduplication semantics.
+
+A stable ID is an idempotency key for the handoff. **Do not reuse the same `(Name, ID)` for different logical work or different payloads.** Doing so is a caller bug: a provider may legitimately report that the earlier handoff already exists.
 
 This protects against an important distributed-systems failure mode:
 
@@ -115,7 +117,7 @@ client <--- response lost ---- X
 client cannot know whether the first handoff succeeded
 ```
 
-A stable logical ID makes retrying the **handoff** safer.
+A stable logical identity makes retrying the **handoff** safer.
 
 It does not provide exactly-once **execution**. Providers such as Cloud Tasks may deliver a task more than once. **Handlers must be idempotent.**
 
@@ -239,7 +241,7 @@ A backend belongs in `runlater` only when the mapping preserves the handoff mode
 1. **Durable acceptance** — success means responsibility has moved out of the request process.
 2. **Provider-managed execution** — `runlater` does not need to introduce its own long-running worker runtime.
 3. **Retryable delivery** — failed execution can be retried by the provider or its managed integration.
-4. **Stable identity mapping** — logical job IDs can map meaningfully to provider identity or deduplication semantics.
+4. **Stable identity mapping** — `(Name, ID)` can map meaningfully to provider identity or deduplication semantics.
 5. **Delayed execution when exposed** — `RunAt` is either supported honestly or rejected explicitly.
 6. **Small adapter surface** — the backend does not force provider-specific types into application code.
 
