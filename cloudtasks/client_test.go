@@ -76,6 +76,21 @@ func TestDispatchCreatesRESTTask(t *testing.T) {
 	}
 }
 
+func TestTaskNameUsesNameAndID(t *testing.T) {
+	d := &Dispatcher{project: "p", location: "l", queue: "q"}
+
+	a := d.taskName("email.send", "42")
+	if a != d.taskName("email.send", "42") {
+		t.Fatal("same name and ID must produce the same task name")
+	}
+	if a == d.taskName("audit.write", "42") {
+		t.Fatal("different job names with the same logical ID must not collide")
+	}
+	if a == d.taskName("email.send", "43") {
+		t.Fatal("different logical IDs must not collide")
+	}
+}
+
 func TestDispatchTreatsAlreadyExistsAsIdempotentSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
