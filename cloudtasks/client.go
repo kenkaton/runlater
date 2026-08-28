@@ -123,8 +123,8 @@ type apiErrorResponse struct {
 	} `json:"error"`
 }
 
-// Dispatch creates one Cloud Task. A stable runlater job ID maps to a stable
-// Cloud Tasks task name, making ambiguous client retries safe within Cloud
+// Dispatch creates one Cloud Task. A stable (Name, ID) pair maps to a stable
+// Cloud Tasks task name, making ambiguous client retries safer within Cloud
 // Tasks' own task-name deduplication semantics.
 func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) (runlater.Receipt, error) {
 	if job.ID == "" {
@@ -136,7 +136,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) (runlater.R
 		return runlater.Receipt{}, fmt.Errorf("cloudtasks: encode envelope: %w", err)
 	}
 
-	providerID := d.taskName(job.ID)
+	providerID := d.taskName(job.Name, job.ID)
 	reqBody := createTaskRequest{Task: task{
 		Name: providerID,
 		HTTPRequest: httpRequest{
@@ -207,8 +207,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) (runlater.R
 	return runlater.Receipt{ID: job.ID, ProviderID: providerID}, nil
 }
 
-func (d *Dispatcher) taskName(id string) string {
-	sum := sha256.Sum256([]byte(id))
-	taskID := hex.EncodeToString(sum[:])
+func (d *Dispatcher) taskName(name, id string) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte(name))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(id))
+	taskID := hex.EncodeToString(h.Sum(nil))
 	return fmt.Sprintf("projects/%s/locations/%s/queues/%s/tasks/%s", d.project, d.location, d.queue, taskID)
 }
