@@ -19,7 +19,7 @@ type Envelope struct {
 // EncodeEnvelope serializes a Job using the runlater wire protocol.
 func EncodeEnvelope(job Job) ([]byte, error) {
 	if job.ID == "" {
-		return nil, fmt.Errorf("runlater: envelope job ID is empty")
+		return nil, ErrEmptyID
 	}
 	if job.Name == "" {
 		return nil, ErrEmptyName
@@ -33,6 +33,11 @@ func EncodeEnvelope(job Job) ([]byte, error) {
 }
 
 // DecodeEnvelope parses and validates a runlater wire envelope.
+//
+// A missing payload decodes to JSON null rather than to nil, so that handlers
+// see a decodable document instead of failing on empty input. Producers that
+// omit the field would otherwise cause a permanently undecodable job that a
+// durable backend retries until the queue gives up.
 func DecodeEnvelope(data []byte) (Envelope, error) {
 	var env Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -42,10 +47,13 @@ func DecodeEnvelope(data []byte) (Envelope, error) {
 		return Envelope{}, fmt.Errorf("runlater: unsupported protocol version %d", env.Version)
 	}
 	if env.ID == "" {
-		return Envelope{}, fmt.Errorf("runlater: envelope job ID is empty")
+		return Envelope{}, ErrEmptyID
 	}
 	if env.Name == "" {
 		return Envelope{}, ErrEmptyName
+	}
+	if len(env.Payload) == 0 {
+		env.Payload = json.RawMessage("null")
 	}
 	return env, nil
 }
