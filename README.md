@@ -75,8 +75,9 @@ type Job struct {
 }
 
 type Receipt struct {
-    ID         string
-    ProviderID string
+    ID           string
+    ProviderID   string
+    Deduplicated bool
 }
 
 type Dispatcher interface {
@@ -103,9 +104,41 @@ receipt, err := later.Do(
 )
 ```
 
-The Cloud Tasks backend deterministically maps `(Name, ID)` to a Cloud Tasks task name. Repeating the same handoff therefore maps to the same provider task, while two different job names may safely reuse the same local ID. When Cloud Tasks explicitly reports `ALREADY_EXISTS`, the backend can treat that as an idempotent handoff success within Cloud Tasks' task-name deduplication semantics.
+The Cloud Tasks backend deterministically maps `(Name, ID)` to a Cloud Tasks task name. Repeating the same handoff therefore maps to the same provider task, while two different job names may safely reuse the same local ID. When Cloud Tasks explicitly reports `ALREADY_EXISTS`, the backend treats that as an idempotent handoff success and sets `Receipt.Deduplicated`.
 
 A stable ID is an idempotency key for the handoff. **Do not reuse the same `(Name, ID)` for different logical work or different payloads.** Doing so is a caller bug: a provider may legitimately report that the earlier handoff already exists.
+
+### The deduplication window outlives execution
+
+This is the sharpest edge in the model and worth stating plainly.
+
+Cloud Tasks refuses to create a task whose name it has recently seen — **including names of tasks that have already run or been deleted**. That window is roughly one hour for queues created through Cloud Tasks, and roughly nine days for queues created from `queue.yaml`.
+
+So a stable `(Name, ID)` is an identity for **one logical occurrence of work**, not a channel you can send down repeatedly:
+
+```go
+// Correct: one welcome email per user, ever.
+runlater.ID("welcome-email:" + userID)
+
+// Wrong: the second call is silently deduplicated, not scheduled.
+runlater.ID("daily-digest:" + userID)
+```
+
+Recurring work needs an ID that varies per occurrence (`"daily-digest:"+userID+":"+date`), or no ID at all.
+
+Because a deduplicated handoff is reported as success, check the receipt when the distinction matters:
+
+```go
+receipt, err := later.Do(ctx, "email.send", payload, runlater.ID(key))
+if err != nil {
+    return err
+}
+if receipt.Deduplicated {
+    // Already accepted earlier, and possibly already executed.
+}
+```
+
+Backends that cannot tell the two cases apart always leave `Deduplicated` false.
 
 This protects against an important distributed-systems failure mode:
 
@@ -157,6 +190,32 @@ http.Handle("/internal/jobs", mux)
 
 Malformed envelopes and unknown jobs return 4xx responses. Handler failures return 5xx so the execution provider can apply its retry policy.
 
+### Permanent failures
+
+Retry policy belongs to the provider, but only the handler knows when retrying is pointless. A payload that cannot decode will not decode on the fourth attempt either.
+
+```go
+return fmt.Errorf("unknown account %q: %w", id, httpjob.ErrPermanent)
+```
+
+An error wrapping `httpjob.ErrPermanent` answers 200, which is the only response that stops a push-style provider — Cloud Tasks retries every non-2xx code, 4xx included. `HandleJSON` wraps its own decode failures this way.
+
+### Observing failures
+
+The HTTP response deliberately carries no detail, so set an error handler or job failures are invisible:
+
+```go
+mux.ErrorHandler = func(r *http.Request, env runlater.Envelope, err error) {
+    log.Printf("job %s/%s failed: %v", env.Name, env.ID, err)
+}
+```
+
+It sees handler errors and pre-handler rejections alike. Suppressing a retry never suppresses the report.
+
+### Authentication
+
+`httpjob` authenticates nothing. Anything that can reach the endpoint can enqueue work into your application, so the route must be protected by the deployment: Cloud Run IAM plus task-level OIDC, an internal-only ingress, a gateway, or equivalent. Keeping IAM at the edge is deliberate — it is only safe if the edge exists.
+
 `httpjob` is intentionally small. It should not grow into a worker framework, scheduler, middleware ecosystem, or workflow engine.
 
 ## Google Cloud Tasks
@@ -195,6 +254,18 @@ _, err := later.Do(ctx, "email.send", payload, runlater.At(runAt))
 
 Provider quotas and evolving service limits are intentionally left to the provider API instead of being copied into `runlater` as policy that can become stale.
 
+### Handoff failures
+
+A failed enqueue returns `*cloudtasks.APIError`, so callers can separate a handoff worth retrying from one that never will be:
+
+```go
+var apiErr *cloudtasks.APIError
+if errors.As(err, &apiErr) && apiErr.Retryable() {
+    // 429 or 5xx. With a stable ID, a retry that arrives after the first
+    // attempt actually landed is deduplicated rather than duplicated.
+}
+```
+
 ## Testing
 
 The handoff boundary should be easy to test without reproducing production infrastructure.
@@ -209,6 +280,14 @@ jobs := mem.Jobs()
 ```
 
 No emulator, credentials, Redis, database, or worker process is required for unit tests.
+
+The in-memory backend accepts every handoff by default. To assert the property that actually breaks in production — a repeated `(Name, ID)` that the provider refuses — turn on deduplication:
+
+```go
+mem := &memory.Dispatcher{Deduplicate: true}
+```
+
+A repeat is then not recorded, and its receipt reports `Deduplicated`.
 
 ## Dependency policy
 

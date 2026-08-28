@@ -81,3 +81,81 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 		t.Fatalf("env = %+v", env)
 	}
 }
+
+func TestAtSchedulesExplicitTime(t *testing.T) {
+	d := &captureDispatcher{}
+	runAt := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := New(d).Do(context.Background(), "job", nil, At(runAt)); err != nil {
+		t.Fatal(err)
+	}
+	if !d.job.RunAt.Equal(runAt) {
+		t.Fatalf("runAt = %s, want %s", d.job.RunAt, runAt)
+	}
+}
+
+// A zero time must not silently degrade into "run immediately": that turns an
+// unpopulated struct field into an instantly executed job.
+func TestAtRejectsZeroTime(t *testing.T) {
+	d := &captureDispatcher{}
+	_, err := New(d).Do(context.Background(), "job", nil, At(time.Time{}))
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("err = %v, want ErrInvalidOption", err)
+	}
+	if d.job.Name != "" {
+		t.Fatal("job must not be dispatched")
+	}
+}
+
+func TestOptionErrors(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name string
+		opts []Option
+		want error
+	}{
+		{"empty ID", []Option{ID("")}, ErrEmptyID},
+		{"duplicate ID", []Option{ID("a"), ID("b")}, ErrInvalidOption},
+		{"negative delay", []Option{After(-time.Second)}, ErrInvalidOption},
+		{"duplicate After", []Option{After(time.Second), After(time.Minute)}, ErrInvalidOption},
+		{"duplicate At", []Option{At(now), At(now)}, ErrInvalidOption},
+		{"At and After", []Option{At(now), After(0)}, ErrInvalidOption},
+		{"nil option", []Option{nil}, ErrInvalidOption},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &captureDispatcher{}
+			_, err := New(d).Do(context.Background(), "job", nil, tt.opts...)
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("err = %v, want %v", err, tt.want)
+			}
+			if d.job.Name != "" {
+				t.Fatal("job must not be dispatched")
+			}
+		})
+	}
+}
+
+func TestDoRequiresName(t *testing.T) {
+	if _, err := New(&captureDispatcher{}).Do(context.Background(), "", nil); !errors.Is(err, ErrEmptyName) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDecodeEnvelopeDefaultsMissingPayloadToNull(t *testing.T) {
+	env, err := DecodeEnvelope([]byte(`{"version":1,"id":"id","name":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(env.Payload) != "null" {
+		t.Fatalf("payload = %q, want null", env.Payload)
+	}
+}
+
+func TestEncodeEnvelopeRequiresIdentity(t *testing.T) {
+	if _, err := EncodeEnvelope(Job{Name: "x"}); !errors.Is(err, ErrEmptyID) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := EncodeEnvelope(Job{ID: "id"}); !errors.Is(err, ErrEmptyName) {
+		t.Fatalf("err = %v", err)
+	}
+}

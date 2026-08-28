@@ -1,3 +1,14 @@
+// Package runlater is a provider-native durable handoff primitive.
+//
+// It owns one small boundary: turning an application value into a
+// provider-neutral [Job] and handing that job to a [Dispatcher]. Durable
+// storage, retry timing, and worker execution belong to the backend's
+// provider, not to this package.
+//
+// A successful [Client.Do] means only that the selected backend accepted
+// responsibility for the job according to that backend's documented
+// guarantees. It does not promise exactly-once execution: providers may
+// deliver a job more than once, so handlers must be idempotent.
 package runlater
 
 import (
@@ -11,12 +22,21 @@ import (
 )
 
 var (
+	// ErrNoDispatcher is returned when a Client has no backend to hand jobs to.
 	ErrNoDispatcher = errors.New("runlater: dispatcher is nil")
-	ErrEmptyName    = errors.New("runlater: job name is empty")
+	// ErrEmptyName is returned when a job has no name.
+	ErrEmptyName = errors.New("runlater: job name is empty")
+	// ErrEmptyID is returned when a job has no identifier.
+	ErrEmptyID = errors.New("runlater: job ID is empty")
+	// ErrInvalidOption wraps every Option misuse, so callers can match all of
+	// them with errors.Is without depending on individual messages.
+	ErrInvalidOption = errors.New("runlater: invalid option")
 )
 
 // Job is the runlater handoff contract. Backends may add stronger guarantees,
 // but must preserve ID, Name, Payload, and RunAt semantics.
+//
+// A zero RunAt means "as soon as the provider can run it".
 type Job struct {
 	ID      string
 	Name    string
@@ -28,6 +48,15 @@ type Job struct {
 type Receipt struct {
 	ID         string
 	ProviderID string
+
+	// Deduplicated reports that the backend recognized this handoff as one it
+	// had already accepted, so no new provider-side job was created. Backends
+	// that cannot distinguish the two cases always leave it false.
+	//
+	// This matters because provider deduplication windows outlive execution:
+	// a Deduplicated receipt can mean the job already ran. Callers that need a
+	// job to run again must use a different logical ID.
+	Deduplicated bool
 }
 
 // Dispatcher hands a job off to a backend. A successful return means the
@@ -66,10 +95,10 @@ type Option func(*options) error
 func ID(id string) Option {
 	return func(o *options) error {
 		if id == "" {
-			return errors.New("runlater: job ID is empty")
+			return fmt.Errorf("%w: %w", ErrInvalidOption, ErrEmptyID)
 		}
 		if o.hasID {
-			return errors.New("runlater: ID specified more than once")
+			return fmt.Errorf("%w: ID specified more than once", ErrInvalidOption)
 		}
 		o.id = id
 		o.hasID = true
@@ -81,10 +110,10 @@ func ID(id string) Option {
 func After(d time.Duration) Option {
 	return func(o *options) error {
 		if d < 0 {
-			return fmt.Errorf("runlater: negative delay: %s", d)
+			return fmt.Errorf("%w: negative delay: %s", ErrInvalidOption, d)
 		}
 		if o.hasDelay {
-			return errors.New("runlater: After specified more than once")
+			return fmt.Errorf("%w: After specified more than once", ErrInvalidOption)
 		}
 		o.delay = d
 		o.hasDelay = true
@@ -93,10 +122,17 @@ func After(d time.Duration) Option {
 }
 
 // At schedules the job for t.
+//
+// A zero t is rejected rather than treated as "run immediately", because an
+// unset time is far more often an unpopulated struct field than a deliberate
+// request. Omit At entirely to run the job as soon as the provider can.
 func At(t time.Time) Option {
 	return func(o *options) error {
+		if t.IsZero() {
+			return fmt.Errorf("%w: At time is zero", ErrInvalidOption)
+		}
 		if o.hasRunAt {
-			return errors.New("runlater: At specified more than once")
+			return fmt.Errorf("%w: At specified more than once", ErrInvalidOption)
 		}
 		o.runAt = t
 		o.hasRunAt = true
@@ -122,14 +158,14 @@ func (c *Client) Do(ctx context.Context, name string, payload any, opts ...Optio
 	var cfg options
 	for _, opt := range opts {
 		if opt == nil {
-			continue
+			return Receipt{}, fmt.Errorf("%w: nil option", ErrInvalidOption)
 		}
 		if err := opt(&cfg); err != nil {
 			return Receipt{}, err
 		}
 	}
 	if cfg.hasRunAt && cfg.hasDelay {
-		return Receipt{}, errors.New("runlater: After and At cannot be used together")
+		return Receipt{}, fmt.Errorf("%w: After and At cannot be used together", ErrInvalidOption)
 	}
 
 	id := cfg.id
