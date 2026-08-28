@@ -1,3 +1,8 @@
+// Package cloudtasks hands runlater jobs to Google Cloud Tasks over its REST
+// API, without gRPC, protobuf, or the Google Cloud Go SDK.
+//
+// Cloud Tasks provides durable, at-least-once delivery. Handlers must be
+// idempotent.
 package cloudtasks
 
 import (
@@ -31,10 +36,41 @@ type Config struct {
 	Queue               string
 	TargetURL           string
 	ServiceAccountEmail string
-	Audience            string
-	HTTPClient          *http.Client
-	TokenSource         TokenSource
-	APIEndpoint         string
+	// Audience sets the OIDC token audience. It requires ServiceAccountEmail:
+	// without it no OIDC token is attached and the audience would be ignored.
+	Audience    string
+	HTTPClient  *http.Client
+	TokenSource TokenSource
+	APIEndpoint string
+}
+
+// APIError reports a non-2xx response from the Cloud Tasks API. Callers can
+// use it to tell a handoff worth retrying from one that will never succeed.
+type APIError struct {
+	StatusCode int
+	// Status is the API's canonical error status, such as PERMISSION_DENIED,
+	// when the response carried one.
+	Status  string
+	Message string
+	Body    string
+}
+
+func (e *APIError) Error() string {
+	detail := e.Message
+	if detail == "" {
+		detail = e.Body
+	}
+	if e.Status != "" {
+		return fmt.Sprintf("cloudtasks: create task: %d %s: %s", e.StatusCode, e.Status, detail)
+	}
+	return fmt.Sprintf("cloudtasks: create task: %d: %s", e.StatusCode, detail)
+}
+
+// Retryable reports whether repeating the handoff could plausibly succeed.
+// Because the job carries a stable task name, a retry that arrives after the
+// first attempt actually landed is deduplicated rather than duplicated.
+func (e *APIError) Retryable() bool {
+	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
 }
 
 // Dispatcher hands runlater jobs off to Google Cloud Tasks using the REST API.
@@ -57,9 +93,21 @@ func New(cfg Config) (*Dispatcher, error) {
 	if cfg.Project == "" || cfg.Location == "" || cfg.Queue == "" || cfg.TargetURL == "" {
 		return nil, fmt.Errorf("cloudtasks: Project, Location, Queue, and TargetURL are required")
 	}
+	for _, f := range []struct{ name, value string }{
+		{"Project", cfg.Project},
+		{"Location", cfg.Location},
+		{"Queue", cfg.Queue},
+	} {
+		if !isResourceID(f.value) {
+			return nil, fmt.Errorf("cloudtasks: %s %q contains characters that are not valid in a resource name", f.name, f.value)
+		}
+	}
 	u, err := url.Parse(cfg.TargetURL)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return nil, fmt.Errorf("cloudtasks: TargetURL must be an absolute http(s) URL")
+	}
+	if cfg.Audience != "" && cfg.ServiceAccountEmail == "" {
+		return nil, fmt.Errorf("cloudtasks: Audience requires ServiceAccountEmail")
 	}
 
 	hc := cfg.HTTPClient
@@ -68,7 +116,9 @@ func New(cfg Config) (*Dispatcher, error) {
 	}
 	ts := cfg.TokenSource
 	if ts == nil {
-		ts = NewMetadataTokenSource(hc)
+		// Deliberately not hc: the metadata server must be reached directly,
+		// never through a configured proxy. See NewMetadataTokenSource.
+		ts = NewMetadataTokenSource(nil)
 	}
 	endpoint := strings.TrimRight(cfg.APIEndpoint, "/")
 	if endpoint == "" {
@@ -86,6 +136,21 @@ func New(cfg Config) (*Dispatcher, error) {
 		tokenSource:         ts,
 		apiEndpoint:         endpoint,
 	}, nil
+}
+
+// isResourceID reports whether s is safe to place in a Cloud Tasks resource
+// name unescaped. Everything allowed here is an unreserved URL path character,
+// so the same value is also safe in the request path.
+func isResourceID(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.', r == ':':
+		default:
+			return false
+		}
+	}
+	return s != ""
 }
 
 type oidcToken struct {
@@ -126,9 +191,16 @@ type apiErrorResponse struct {
 // Dispatch creates one Cloud Task. A stable (Name, ID) pair maps to a stable
 // Cloud Tasks task name, making ambiguous client retries safer within Cloud
 // Tasks' own task-name deduplication semantics.
+//
+// When Cloud Tasks reports ALREADY_EXISTS the handoff is treated as successful
+// and the receipt is marked Deduplicated. Note that this window outlives
+// execution: Cloud Tasks refuses a task name for roughly an hour after the task
+// ran or was deleted (about nine days for queues created from queue.yaml), so a
+// deduplicated receipt can mean the job already ran. Work that must run again
+// needs a different logical ID.
 func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) (runlater.Receipt, error) {
 	if job.ID == "" {
-		return runlater.Receipt{}, fmt.Errorf("cloudtasks: job ID is required")
+		return runlater.Receipt{}, runlater.ErrEmptyID
 	}
 
 	payload, err := runlater.EncodeEnvelope(job)
@@ -190,9 +262,14 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) (runlater.R
 		var apiErr apiErrorResponse
 		_ = json.Unmarshal(b, &apiErr)
 		if resp.StatusCode == http.StatusConflict && apiErr.Error.Status == "ALREADY_EXISTS" {
-			return runlater.Receipt{ID: job.ID, ProviderID: providerID}, nil
+			return runlater.Receipt{ID: job.ID, ProviderID: providerID, Deduplicated: true}, nil
 		}
-		return runlater.Receipt{}, fmt.Errorf("cloudtasks: create task: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return runlater.Receipt{}, &APIError{
+			StatusCode: resp.StatusCode,
+			Status:     apiErr.Error.Status,
+			Message:    apiErr.Error.Message,
+			Body:       strings.TrimSpace(string(b)),
+		}
 	}
 
 	// A 2xx means Cloud Tasks accepted responsibility. Response decoding is
@@ -201,9 +278,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job runlater.Job) (runlater.R
 	var out createTaskResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err == nil && out.Name != "" {
 		providerID = out.Name
-	} else {
-		_, _ = io.Copy(io.Discard, resp.Body)
 	}
+	// Drain whatever the decoder left behind so the connection can be reused.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	return runlater.Receipt{ID: job.ID, ProviderID: providerID}, nil
 }
 
