@@ -2,9 +2,9 @@
 
 > Hand work off now. Run it later, reliably.
 
-`runlater` is a small **durable handoff primitive** for Go applications.
+`runlater` is a small **provider-native durable handoff primitive** for Go.
 
-It is intentionally not another worker framework. Your cloud already has durable execution systems such as Google Cloud Tasks. `runlater` gives application code one small contract for handing work to those systems without importing their SDK types, worker runtimes, or infrastructure concerns.
+It is intentionally not another background-job framework. Cloud platforms already provide durable execution systems such as Google Cloud Tasks. `runlater` gives application code one small, testable boundary for handing work to those systems without importing provider SDK types, running a worker daemon, or pulling a large dependency graph into the service.
 
 ```go
 receipt, err := later.Do(
@@ -15,17 +15,17 @@ receipt, err := later.Do(
 )
 ```
 
-The first production backend is Google Cloud Tasks over REST: no gRPC, no protobuf, no Google Cloud Go SDK, and no worker daemon.
+The first production backend is Google Cloud Tasks over REST: no gRPC, no protobuf, no Google Cloud Go SDK, and no worker runtime owned by `runlater`.
 
 ## Why this exists
 
-Go already has excellent background-job libraries. If you want Redis/Postgres-backed workers, retries, cron, dashboards, workflow primitives, or queue ownership inside your application, use those libraries.
+Go already has excellent job systems. Asynq and gocraft/work are good choices when you want Redis-backed workers. River is a good choice when you want jobs owned in Postgres. Neoq is a good choice when you want a broader queue-agnostic job framework.
 
-`runlater` targets a narrower problem:
+`runlater` solves a narrower problem:
 
-> **I already trust my cloud to execute durable background work. I only want a tiny, testable boundary in my Go application for handing work to it.**
+> **My platform already knows how to durably execute work. I want my Go application to express only the handoff, not own another job system.**
 
-That leads to a deliberately different architecture:
+That distinction is the project.
 
 ```text
 application
@@ -34,33 +34,37 @@ application
     v
 runlater handoff contract
     |
-    +---- Cloud Tasks (first backend)
-    +---- other cloud-native durable backends only when semantics fit
-
-provider invokes HTTP target
+    v
+provider-managed durable execution
     |
     v
-httpjob.Mux
-    |
-    v
-typed Go handler
+application handler
 ```
 
-### Non-goals
+`runlater` should stay thin in features and opinionated in semantics.
 
-`runlater` does **not** aim to become:
+## Ownership model
 
-- a Redis/Postgres job server
-- a worker-pool framework
-- a workflow engine
-- a generic message-broker abstraction
-- a lowest-common-denominator wrapper over every queue product
+Correctness depends on keeping responsibilities explicit.
 
-Provider differences that affect correctness stay visible in backend documentation.
+| Concern | Owner |
+| --- | --- |
+| Job identity and handoff intent | `runlater` |
+| JSON wire envelope and versioning | `runlater` |
+| Provider translation | backend package |
+| Durable storage | provider |
+| Retry timing / rate limiting / queue policy | provider |
+| Authentication / IAM | deployment / provider configuration |
+| Business idempotency | application handler |
+| Workflow orchestration | application or another system |
 
-## The contract
+A successful `Dispatch` means only this:
 
-The root package defines only the handoff semantics:
+> **The selected backend accepted responsibility for the job according to that backend's documented guarantees.**
+
+Durability is therefore a backend property, not something the root interface pretends to guarantee. The `memory` backend is intentionally useful for tests and intentionally not durable.
+
+## Core contract
 
 ```go
 type Job struct {
@@ -70,18 +74,25 @@ type Job struct {
     RunAt   time.Time
 }
 
+type Receipt struct {
+    ID         string
+    ProviderID string
+}
+
 type Dispatcher interface {
     Dispatch(context.Context, Job) (Receipt, error)
 }
 ```
 
-A successful `Dispatch` means the backend has accepted responsibility for the job according to that backend's documented guarantees.
+The root package deliberately knows nothing about queues, service accounts, Redis, visibility timeouts, Cloud Tasks protobufs, or SQS message attributes.
 
-**Durability is a backend guarantee, not a lie told by the interface.** For example, the `memory` dispatcher is useful for tests but is explicitly not durable.
+## Job identity and retry safety
 
-## Stable job IDs and safe retries
+Every job has a logical ID.
 
-Every job has a logical ID. `runlater` generates one by default, but important jobs should usually provide a stable ID:
+If no ID is supplied, `runlater` generates one. A generated ID gives the job a unique identity, but **does not make a repeated call retry-safe**, because the next call receives a different ID.
+
+For an operation that may be retried, provide a stable ID derived from the business operation:
 
 ```go
 receipt, err := later.Do(
@@ -92,15 +103,25 @@ receipt, err := later.Do(
 )
 ```
 
-The Cloud Tasks backend hashes that logical ID into a deterministic Cloud Tasks task name. Repeating the same handoff ID therefore maps to the same provider task, and an `ALREADY_EXISTS` response is treated as an idempotent success **within Cloud Tasks' own task-name deduplication semantics**.
+The Cloud Tasks backend deterministically maps that logical ID to a Cloud Tasks task name. Repeating the same handoff ID therefore maps to the same provider task. When Cloud Tasks explicitly reports `ALREADY_EXISTS`, the backend can treat that as an idempotent handoff success within Cloud Tasks' task-name deduplication semantics.
 
-This addresses a common distributed-systems failure mode: the provider accepted a task, but the client lost the response and cannot tell whether retrying will duplicate the enqueue.
+This protects against an important distributed-systems failure mode:
 
-This does **not** provide exactly-once execution. Cloud Tasks is at-least-once. **Handlers must be idempotent.**
+```text
+client ---- create task ----> provider
+                         task accepted
+client <--- response lost ---- X
+
+client cannot know whether the first handoff succeeded
+```
+
+A stable logical ID makes retrying the **handoff** safer.
+
+It does not provide exactly-once **execution**. Providers such as Cloud Tasks may deliver a task more than once. **Handlers must be idempotent.**
 
 ## Versioned wire protocol
 
-HTTP-style backends use a small versioned envelope:
+For HTTP-style delivery, `runlater` owns a small provider-independent envelope:
 
 ```json
 {
@@ -113,11 +134,11 @@ HTTP-style backends use a small versioned envelope:
 }
 ```
 
-Versioning the envelope early keeps producers and consumers evolvable without coupling application code to provider payload formats.
+The envelope is intentionally versioned from the beginning. Provider request formats should not become the application's protocol, and producers and consumers should be able to evolve without being coupled to Cloud Tasks, SQS, or another backend.
 
 ## Receiving jobs
 
-`httpjob` is the other half of the primitive. It routes the wire protocol to typed Go handlers using only `net/http`.
+`httpjob` is the minimal receiving-side adapter for push/HTTP-style executors. It converts the wire envelope back into a typed Go handler using only `net/http`.
 
 ```go
 mux := httpjob.New()
@@ -132,7 +153,9 @@ if err != nil {
 http.Handle("/internal/jobs", mux)
 ```
 
-Malformed envelopes and unknown jobs return 4xx responses. Handler failures return 500 so durable HTTP backends can retry according to their policies.
+Malformed envelopes and unknown jobs return 4xx responses. Handler failures return 5xx so the execution provider can apply its retry policy.
+
+`httpjob` is intentionally small. It should not grow into a worker framework, scheduler, middleware ecosystem, or workflow engine.
 
 ## Google Cloud Tasks
 
@@ -152,9 +175,9 @@ later := runlater.New(dispatcher)
 _, err = later.Do(ctx, "email.send", EmailPayload{UserID: 42})
 ```
 
-On Cloud Run, the backend uses the metadata server for the attached service account's OAuth token by default.
+On Cloud Run, the backend uses the metadata server for the attached service account's OAuth access token by default.
 
-Authenticated targets can use task-level OIDC configuration, or preferably queue-level target/auth configuration when you want IAM concerns kept out of application code.
+Authenticated targets can use task-level OIDC configuration. When possible, queue-level target/auth configuration is preferable because it keeps IAM and deployment policy outside application code.
 
 ### Delayed execution
 
@@ -168,11 +191,11 @@ or:
 _, err := later.Do(ctx, "email.send", payload, runlater.At(runAt))
 ```
 
-Provider quotas and evolving service limits are intentionally left to the provider API instead of being duplicated as stale policy inside `runlater`.
+Provider quotas and evolving service limits are intentionally left to the provider API instead of being copied into `runlater` as policy that can become stale.
 
 ## Testing
 
-No emulator, credentials, Redis, or worker process is required for unit tests.
+The handoff boundary should be easy to test without reproducing production infrastructure.
 
 ```go
 mem := &memory.Dispatcher{}
@@ -183,35 +206,92 @@ _, _ = later.Do(ctx, "email.send", payload, runlater.ID("test-job"))
 jobs := mem.Jobs()
 ```
 
+No emulator, credentials, Redis, database, or worker process is required for unit tests.
+
 ## Dependency policy
 
 The module currently has **zero third-party dependencies**.
 
-This is a product constraint, not a stunt. The original motivation for `runlater` was that a tiny background handoff should not introduce gRPC, protobuf, a large cloud SDK dependency graph, unrelated vulnerability alerts, or additional worker infrastructure.
+That is a product constraint, not a benchmark trick. The original motivation for `runlater` was that a tiny background handoff should not introduce gRPC, protobuf, a large cloud SDK dependency graph, unrelated vulnerability alerts, or another worker runtime.
 
-Backends should remain standard-library-first where doing so does not compromise correctness.
+Backends should remain standard-library-first where doing so does not compromise correctness. A dependency may be added if correctness clearly requires it; dependency count is not more important than semantics.
+
+## What runlater will not become
+
+`runlater` does **not** aim to become:
+
+- a Redis/Postgres job server
+- a worker-pool runtime
+- a workflow or DAG engine
+- a cron system
+- a dashboard
+- a generic message-broker abstraction
+- a lowest-common-denominator API over every queue product
+
+If an addition requires `runlater` to reimplement a capability that the execution provider already owns well, the default answer should be **no**.
+
+## Backend acceptance criteria
+
+A new backend should not be added merely because it can transport bytes.
+
+A backend belongs in `runlater` only when the mapping preserves the handoff model without hiding correctness-relevant differences. In practice, it should satisfy most of the following:
+
+1. **Durable acceptance** — success means responsibility has moved out of the request process.
+2. **Provider-managed execution** — `runlater` does not need to introduce its own long-running worker runtime.
+3. **Retryable delivery** — failed execution can be retried by the provider or its managed integration.
+4. **Stable identity mapping** — logical job IDs can map meaningfully to provider identity or deduplication semantics.
+5. **Delayed execution when exposed** — `RunAt` is either supported honestly or rejected explicitly.
+6. **Small adapter surface** — the backend does not force provider-specific types into application code.
+
+This means "supports queues" is not enough. For example, a backend that requires `runlater` itself to operate polling workers would change the architecture and should probably live in a different project.
+
+## Design principles
+
+These principles are intended to constrain future development:
+
+**1. Own the seam, not the system.**  
+`runlater` owns the application boundary between "do this later" and a provider that already knows how to execute it.
+
+**2. Thin API, strong semantics.**  
+A small wrapper is valuable only if it removes accidental complexity while preserving correctness-relevant behavior.
+
+**3. Provider differences are not bugs to abstract away.**  
+Do not manufacture a fake universal queue model. Document backend guarantees and expose incompatibility when semantics do not map.
+
+**4. Make ambiguous failure safer.**  
+Logical IDs, receipts, and backend identity mapping should help callers reason about uncertain handoff outcomes.
+
+**5. Keep infrastructure policy at the edge.**  
+IAM, retry policy, queue rate limits, quotas, and deployment configuration belong to providers and infrastructure tooling unless application correctness requires otherwise.
+
+**6. No worker infrastructure by accident.**  
+Adding a backend must not quietly turn `runlater` into the job system it was created to avoid.
+
+**7. Prefer boring Go.**  
+Small interfaces, `context.Context`, `net/http`, `encoding/json`, explicit errors, and minimal dependencies are features.
 
 ## How it differs from existing Go job libraries
 
-Libraries such as Asynq and gocraft/work own a worker runtime and use Redis. Neoq abstracts multiple queue/storage backends and also provides job processing features. River owns durable jobs in Postgres. Those are good choices when the application wants to own the job system.
+Traditional Go job frameworks usually own more of the system. That is useful when you want the application to own job persistence and worker execution.
 
-`runlater` deliberately owns much less:
+`runlater` deliberately owns less:
 
-| Concern | runlater | Traditional Go job framework |
+| Concern | runlater | Traditional job framework |
 | --- | --- | --- |
-| Durable store | Cloud/provider owns it | Library/app owns it |
-| Worker runtime | Provider invokes target | Library runs workers |
+| Durable store | Provider owns it | Library/app usually owns it |
+| Worker runtime | Provider-managed | Library/app-managed |
 | Redis/Postgres required | No | Often |
-| Cloud SDK types in app | No | N/A |
-| Provider-native retry/rate limiting | Reused | Reimplemented/configured by framework |
-| Main abstraction | Durable handoff | Queue + workers |
+| Provider SDK types in business code | No | N/A |
+| Retry/rate limiting | Reuse provider | Framework config/runtime |
+| Main abstraction | Handoff | Queue + workers |
+| Workflow features | Non-goal | Often available |
 | Third-party dependencies | 0 today | Usually several |
 
-The project should only add a backend when it can preserve the handoff contract without pretending important semantic differences do not exist.
+The goal is not to be more capable than those libraries. The goal is to make a much smaller architectural choice possible.
 
 ## Status
 
-Pre-v1. The API is intentionally still being challenged before the first stable release.
+Pre-v1. The API and semantics are intentionally being challenged before the first stable release.
 
 ## License
 
